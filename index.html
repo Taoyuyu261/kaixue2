@@ -663,6 +663,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
         function removeChild(id, event) {
             event.stopPropagation();
             if (!confirm('确定删除这个孩子吗？')) return;
+            collectCurrentForm(false); // 删除前先保存当前显示的表单，避免丢失未保存的修改
             children = children.filter(c => c.id !== id);
             saveToStorage();
             if (children.length === 0) addChild();
@@ -731,10 +732,24 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                 showToast('已重置全部数据', 'success');
             });
             window.addEventListener('beforeunload', () => collectCurrentForm(false));
+
+            // 自动保存：任何输入变化后 500ms 自动收集并写入本地存储。
+            // 绑定在 mainContent 上（事件委托），只绑定一次，避免每次渲染表单都叠加监听器。
+            let autoSaveTimer = null;
+            document.getElementById('mainContent').addEventListener('input', () => {
+                if (autoSaveTimer) clearTimeout(autoSaveTimer);
+                autoSaveTimer = setTimeout(() => {
+                    // 定时器触发时再判断：只有表单视图下才收集（其他视图没有表单元素）
+                    if (currentView === 'form') collectCurrentForm(false);
+                }, 500);
+            });
         }
 
         function switchView(view) {
-            collectCurrentForm(false);
+            // 注意：这里绝不能调用 collectCurrentForm！
+            // 调用方必须先收集表单、再切换 currentChildId、最后才调 switchView。
+            // 若在此处收集，currentChildId 已指向新孩子而 DOM 仍是旧孩子的内容，
+            // 会把旧孩子的数据覆盖写入新孩子（信息互相覆盖 BUG 的根源）。
             currentView = view;
             document.querySelectorAll('.nav-item').forEach(n => n.classList.toggle('active', n.dataset.view === view));
             document.getElementById('pageTitle').textContent = view === 'form' ? '填写调查表' : view === 'preview' ? '信件预览' : '批量生成';
@@ -839,6 +854,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             try {
                 localStorage.setItem(STORAGE_KEY, JSON.stringify(children));
                 localStorage.setItem(STORAGE_DATE_KEY, formatDate());
+                if (currentChildId) localStorage.setItem(STORAGE_KEY + '_current', currentChildId);
             } catch (e) { console.warn('本地存储失败', e); }
         }
 
@@ -849,7 +865,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                     const parsed = JSON.parse(data);
                     if (Array.isArray(parsed) && parsed.length > 0) {
                         children = parsed;
-                        currentChildId = children[0].id;
+                        // 优先恢复上次正在编辑的孩子；找不到时默认第一个
+                        const lastId = localStorage.getItem(STORAGE_KEY + '_current');
+                        currentChildId = children.some(c => c.id === lastId) ? lastId : children[0].id;
                     }
                 }
                 const date = localStorage.getItem(STORAGE_DATE_KEY);
@@ -911,13 +929,6 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             container.appendChild(dims);
             container.appendChild(narrative);
             container.appendChild(hint);
-
-            // 自动保存：任何输入变化后 500ms 自动收集并写入本地存储
-            let autoSaveTimer = null;
-            container.addEventListener('input', () => {
-                if (autoSaveTimer) clearTimeout(autoSaveTimer);
-                autoSaveTimer = setTimeout(() => collectCurrentForm(false), 500);
-            });
         }
 
         function renderRadioGroup(name, options, selected) {
@@ -951,8 +962,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             const panel = document.createElement('div');
             panel.className = 'panel';
             panel.innerHTML = `
-                <div class="panel-title">📦 生成全班家长反馈信 Word 文档</div>
-                <p class="help-text">以下列表中“可生成”的孩子已填写完整 10 项维度。点击“一键生成”后，系统会把所有孩子的信件合并到一个 Word 文档中（每个孩子一页），您可以选择保存路径。</p>
+                <div class="panel-title">📦 生成全班家长反馈信</div>
+                <p class="help-text">以下列表中“可生成”的孩子已填写完整 10 项维度。请选择生成方式：</p>
                 <div class="batch-list" style="margin: 16px 0;">
                     ${children.map(child => {
                         const info = child.form.info;
@@ -960,19 +971,23 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                         return `<div class="batch-item"><div class="batch-info"><span style="font-weight:600;">${escapeHtml(info.name || '未命名')}</span><span style="font-size:12px;color:var(--warm-text-light);">${escapeHtml(info.className || '未填班级')}</span></div><span class="batch-status ${ready ? 'ready' : 'incomplete'}">${ready ? '可生成' : '信息不完整'}</span></div>`;
                     }).join('')}
                 </div>
-                <div style="display:flex;gap:12px;margin-top:20px;">
-                    <button class="btn btn-primary" id="batchGenerate" ${validChildren.length === 0 ? 'disabled' : ''}>📥 一键生成 ${validChildren.length} 封信（合并 Word）</button>
+                <div style="display:flex;gap:12px;margin-top:20px;flex-wrap:wrap;">
+                    <button class="btn btn-primary" id="batchGenerateWord" ${validChildren.length === 0 ? 'disabled' : ''}>📄 一键生成 ${validChildren.length} 封信（合并为一个 Word）</button>
+                    <button class="btn btn-primary" id="batchGenerateZip" ${validChildren.length === 0 ? 'disabled' : ''}>🗂 一键生成 ${validChildren.length} 封信（ZIP 压缩包，一人一个 Word）</button>
                 </div>
                 ${incomplete.length > 0 ? `<p class="help-text" style="color:var(--warm-primary);margin-top:12px;">⚠️ 还有 ${incomplete.length} 个孩子信息不完整，请返回“填写调查表”补充完整。</p>` : ''}
+                <p class="help-text" style="margin-top:12px;">两种方式都会先弹出保存路径选择框：合并 Word 适合整体存档打印；ZIP 压缩包里每个孩子一个独立 Word 文件，方便逐个发送给家长。</p>
             `;
             container.appendChild(panel);
 
-            document.getElementById('batchGenerate').addEventListener('click', async () => {
+            const batchBtnHandler = async (mode) => {
                 if (!collectCurrentForm(true)) return;
                 const readyChildren = children.filter(c => getMissingFields(c).length === 0);
                 if (readyChildren.length === 0) { showToast('没有可生成信件的孩子，请检查调查表是否填写完整。', 'error'); return; }
-                await generateBatchDocs(readyChildren);
-            });
+                await generateBatchDocs(readyChildren, mode);
+            };
+            document.getElementById('batchGenerateWord').addEventListener('click', () => batchBtnHandler('word'));
+            document.getElementById('batchGenerateZip').addEventListener('click', () => batchBtnHandler('zip'));
         }
 
         function escapeHtml(text) { return text ? text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;') : ''; }
@@ -1347,7 +1362,9 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             setTimeout(() => { toast.style.display = 'none'; }, 3000);
         }
 
-        async function generateBatchDocs(readyChildren) {
+        async function generateBatchDocs(readyChildren, mode) {
+            // mode: 'word' 所有信件合并到一个 Word；'zip' 压缩包（一个孩子一个 Word）
+            const isZip = mode === 'zip';
             const overlay = document.getElementById('progressOverlay');
             const fill = document.getElementById('progressFill');
             const text = document.getElementById('progressText');
@@ -1356,9 +1373,11 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             submitDate = formatDate();
             saveToStorage();
 
-            const fileName = (readyChildren[0].form.info.className || '班级') + '_入园首月家长反馈信.docx';
+            const className = readyChildren[0].form.info.className || '班级';
+            const fileName = className + '_入园首月家长反馈信.' + (isZip ? 'zip' : 'docx');
+            const mime = isZip ? 'application/zip' : 'application/vnd.openxmlformats-officedocument.wordprocessingml.document';
 
-            // 修复①：先弹出保存路径选择框，再生成文档。
+            // 先弹出保存路径选择框，再生成文档。
             // showSaveFilePicker 要求"瞬态用户激活"（点击后约 5 秒内有效），
             // 旧的"先生成后弹窗"流程在生成全班信件时容易超时，
             // 导致 SecurityError 被静默吞掉、保存路径选不上。
@@ -1367,7 +1386,7 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                 try {
                     handle = await window.showSaveFilePicker({
                         suggestedName: fileName,
-                        types: [{ description: 'Word 文档', accept: { 'application/vnd.openxmlformats-officedocument.wordprocessingml.document': ['.docx'] } }]
+                        types: [{ description: isZip ? 'ZIP 压缩包' : 'Word 文档', accept: { [mime]: [isZip ? '.zip' : '.docx'] } }]
                     });
                 } catch (e) {
                     if (e.name === 'AbortError') {
@@ -1392,15 +1411,28 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                 }
 
                 fill.style.width = '100%';
-                text.textContent = '生成 Word 文档中…';
+                text.textContent = isZip ? '生成 Word 并打包中…' : '生成 Word 文档中…';
 
-                const buffer = await exportCombinedDocToBuffer(allChildren);
-                if (!buffer || buffer.length === 0) throw new Error('Word 文档内容生成为空');
-
-                const blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+                let blob;
+                if (isZip) {
+                    // 一个孩子一个独立 Word 文件，打包成 ZIP（文件直接放在压缩包根目录）
+                    const zip = new JSZip();
+                    for (const item of allChildren) {
+                        const buf = await exportSingleDocToBuffer(item.child, item.letter);
+                        if (!buf || buf.length === 0) throw new Error(item.child.form.info.name + ' 的 Word 文档生成为空');
+                        zip.file(`${item.child.form.info.name}_入园首月家长反馈信.docx`, buf);
+                    }
+                    const zipBytes = await zip.generateAsync({ type: 'uint8array', compression: 'DEFLATE', compressionOptions: { level: 6 } });
+                    if (!zipBytes || zipBytes.length === 0) throw new Error('压缩包内容生成为空');
+                    blob = new Blob([zipBytes], { type: 'application/zip' });
+                } else {
+                    const buffer = await exportCombinedDocToBuffer(allChildren);
+                    if (!buffer || buffer.length === 0) throw new Error('Word 文档内容生成为空');
+                    blob = new Blob([buffer], { type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' });
+                }
 
                 if (handle) {
-                    // 修复②：统一用 Blob 写入（浏览器兼容性最好的数据类型），
+                    // 统一用 Blob 写入（浏览器兼容性最好的数据类型），
                     // 并在 close() 后回读文件大小校验，确保内容真实写入磁盘；
                     // 注意：保存框一确认，目标文件就会被立即创建/清空，
                     // 若写入失败而不校验，用户所选路径上就会留下一个空文件。
@@ -1432,6 +1464,46 @@ https://github.com/nodeca/pako/blob/main/LICENSE
             } finally {
                 setTimeout(() => { overlay.style.display = 'none'; }, 500);
             }
+        }
+
+        // 公共：Blob 转 Uint8Array（兼容旧浏览器 FileReader 降级）
+        async function blobToBytes(blob) {
+            if (blob.arrayBuffer) {
+                const arrayBuffer = await blob.arrayBuffer();
+                return new Uint8Array(arrayBuffer);
+            }
+            return new Promise((resolve, reject) => {
+                const reader = new FileReader();
+                reader.onload = () => resolve(new Uint8Array(reader.result));
+                reader.onerror = reject;
+                reader.readAsArrayBuffer(blob);
+            });
+        }
+
+        // 公共：按公文页边距构建 Document
+        function buildDoc(paragraphs) {
+            return new Document({
+                sections: [{
+                    properties: {
+                        page: {
+                            margin: {
+                                top: convertInchesToTwip(1.4567),
+                                bottom: convertInchesToTwip(1.3779),
+                                left: convertInchesToTwip(1.1024),
+                                right: convertInchesToTwip(1.0236)
+                            }
+                        }
+                    },
+                    children: paragraphs
+                }]
+            });
+        }
+
+        // 生成单个孩子的独立 Word 文档（用于 ZIP 模式）
+        async function exportSingleDocToBuffer(child, letterText) {
+            const paragraphs = letterTextToParagraphs(letterText, child.form.info, false);
+            const blob = await Packer.toBlob(buildDoc(paragraphs));
+            return await blobToBytes(blob);
         }
 
         function letterTextToParagraphs(letterText, info, pageBreakBefore) {
@@ -1499,33 +1571,8 @@ https://github.com/nodeca/pako/blob/main/LICENSE
                 allParagraphs.push(...paragraphs);
             });
 
-            const doc = new Document({
-                sections: [{
-                    properties: {
-                        page: {
-                            margin: {
-                                top: convertInchesToTwip(1.4567),
-                                bottom: convertInchesToTwip(1.3779),
-                                left: convertInchesToTwip(1.1024),
-                                right: convertInchesToTwip(1.0236)
-                            }
-                        }
-                    },
-                    children: allParagraphs
-                }]
-            });
-
-            const blob = await Packer.toBlob(doc);
-            if (blob.arrayBuffer) {
-                const arrayBuffer = await blob.arrayBuffer();
-                return new Uint8Array(arrayBuffer);
-            }
-            return new Promise((resolve, reject) => {
-                const reader = new FileReader();
-                reader.onload = () => resolve(new Uint8Array(reader.result));
-                reader.onerror = reject;
-                reader.readAsArrayBuffer(blob);
-            });
+            const blob = await Packer.toBlob(buildDoc(allParagraphs));
+            return await blobToBytes(blob);
         }
 
         init();
